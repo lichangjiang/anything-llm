@@ -8,16 +8,24 @@
 
 ### 1. `server/utils/collectorApi/index.js`
 
-- **职责**：封装对 Collector 服务的 HTTP 调用，用于文档和链接内容的解析。
+- **职责**：封装对 Collector 服务的 HTTP 调用，用于文档和链接内容的解析。Collector 内部会根据文件后缀选择不同的解析器（如 PDF、DOCX 等），并返回统一结构的 `documents`。
 - **关键方法：`parseDocument(filename)`**
   - 入参：`filename` 为需要解析的文件名（位于 Collector 热目录）。
   - 行为：
-    - 组装请求体 `{ filename, options: this.#attachOptions() }`。
-    - 调用 `${this.endpoint}/parse` 的 POST 接口。
-    - 返回解析结果 `{ success, reason, documents }`。
+    - 组装请求体 `{ filename, options: this.#attachOptions() }`，其中 `options` 会携带 OCR 语言等解析配置。
+    - 调用 `${this.endpoint}/parse` 的 POST 接口，由 Collector 侧的 `collector/processSingleFile` 根据文件扩展名路由到对应的解析器：
+      - **PDF (`.pdf`)**：使用 `collector/processSingleFile/convert/asPDF/index.js`
+        - 内部通过 `PDFLoader` 加载 PDF，每一页提取文字，按行简单拼接后，每页生成一个文档对象：
+          `[{ pageContent, metadata: { source, pdf: { version, info, metadata, totalPages }, loc: { pageNumber } } }, ...]`。
+        - 当前实现中构造 `PDFLoader` 时固定传入 `{ splitPages: true }`，因此默认是“按页切分”的结果返回，`documents` 通常为多条，每条对应一页。
+      - **DOCX (`.docx`)**：使用 `collector/processSingleFile/convert/asDocx.js`
+        - 使用 LangChain 的 `DocxLoader` 抽取文本，将 loader 返回的多段 `pageContent` 直接 `join("")` 合并为一个长字符串，生成单个文档对象：
+          `{ pageContent: fullText, metadata: { source, createdDate, wordCount, token_count_estimate, ... } }`。
+        - 因此 `documents` 通常只包含一条“整篇文档”的记录。
+    - 将 Collector 返回的解析结果直接透传给调用方：`{ success, reason, documents }`。
   - 位置：大约在文件 255 行附近。
 - **相关方法：`getLinkContent(link, captureAs)`**
-  - 作用：对一个 URL 抓取文本或 HTML 内容，供后续作为文档输入。
+  - 作用：对一个 URL 抓取文本或 HTML 内容，封装成与上面 `documents` 相似的结构，供后续作为文档输入使用。
 
 ### 2. 聊天附件解析：`server/utils/chats/apiChatHandler.js`
 
@@ -149,6 +157,36 @@
        - 将 `vectors` 按 500 条一组拆分，批量插入到 LanceDB 集合中。
        - 调用 `storeVectorResult(chunks, fullFilePath)` 缓存嵌入结果，供下次复用。
      - 最后调用 `DocumentVectors.bulkInsert(documentVectors)` 完成数据库映射记录，并返回成功标记。
+
+  - 进一步说明：
+
+    - `chunkSize` 的默认来源：
+      - 代码中通过 `SystemSettings.getValueOrFallback({ label: "text_splitter_chunk_size" })` 读取系统配置；
+      - 再由 `TextSplitter.determineMaxChunkSize(配置值, EmbedderEngine.embeddingMaxChunkLength)` 做一次裁剪，保证不会超过嵌入模型允许的最大长度。因此实际生效的 `chunkSize` 受“系统配置 + 模型上限”共同约束。
+
+    - `text_splitter_chunk_overlap` / `chunkOverlap` 的含义：
+      - 表示**相邻两个文本块之间的重叠长度**（字符或 token 数），默认 fallback 为 `20`；
+      - 举例：若 `chunkSize = 100`、`chunkOverlap = 20`，原始文本足够长时，切分出的块大致为：
+        - 第 1 块覆盖 `[0, 99]`；
+        - 第 2 块从 `100 - 20 = 80` 开始，覆盖 `[80, 179]`，与第 1 块在 `[80, 99]` 这 20 个单位上发生重叠；
+        - 第 3 块从 `180 - 20 = 160` 开始，覆盖 `[160, 259]`，依此类推。
+      - 通过这种重叠，可以在块与块之间保留一定的上下文，便于向量检索时捕获跨句子、跨段落的信息。
+
+    - “一块文本对应一条向量记录”的过程：
+      - `textSplitter.splitText(pageContent)` 得到 `textChunks` 数组；
+      - `EmbedderEngine.embedChunks(textChunks)` 返回与之等长的 `vectorValues` 数组；
+      - 随后的 `for (const [i, vector] of vectorValues.entries())` 循环中：
+        - 第 `i` 个向量 `vector` 与第 `i` 个文本块 `textChunks[i]` 一一对应；
+        - 为每个向量生成唯一 `id`，并构造 `vectorRecord`（含 `values` 与 `metadata.text = textChunks[i]`）；
+        - 推入 `vectors` 与 `submissions`，同时在 `documentVectors` 中记录 `{ docId, vectorId }`；
+      - 因此：**每一个切分出来的文本块都会生成一条独立的向量记录，并存入对应的 LanceDB collection 中。**
+
+    - LanceDB 中一条记录的典型结构（概念上）：
+      - 在 `updateOrCreateCollection(client, submissions, namespace)` 中，`submissions` 数组的每一项类似：
+        - `{ id: string, vector: number[], text: string, source: string, docId?: string, ...其他 metadata }`；
+      - 在 LanceDB 视角，即某个 `namespace` 下的一张表/集合：
+        - 列包括：`id`（主键）、`vector`（向量列）、`text`（原文 chunk）、以及各种业务相关元数据字段；
+      - 结合应用侧的 `DocumentVectors` 映射表 `{ docId, vectorId }`，可以在需要删除某个文档或检索其相关片段时，快速定位并操作 LanceDB 中对应的所有向量行。
 
 #### 2.2 相似度检索：`performSimilaritySearch({...})`
 
